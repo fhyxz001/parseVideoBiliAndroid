@@ -11,6 +11,7 @@
 |------|------|
 | 多种输入 | B 站分享文案、`b23.tv` / `bili2233.cn` 短链、网页链接、`BV` 号、`av` 号 |
 | 系统分享直达 | 在 B 站 App 里点分享 → 选择本应用，自动填入并解析 |
+| **Cookie 登录 / 1080P** | 配置 Cookie 后按账号权限自动获取 1080P / 1080P+ / 1080P60，大会员可到 4K / HDR |
 | 视频信息 | 封面、标题、UP 主头像与昵称、时长、清晰度、分 P 数、文件大小 |
 | 播放预览 | 点击封面用 ExoPlayer 全屏预览（带播放控制） |
 | 下载视频 | 保存到相册 `DCIM/BiliParser`，显示百分比与已下载 / 总大小 |
@@ -19,9 +20,36 @@
 | 复制 | 点击标题复制标题，点击 UP 主复制昵称 |
 | 响应式 | 手机 / 平板自适应，浅色 iOS 风格毛玻璃卡片 |
 
+## 配置 Cookie · 1080P 高清
+
+游客模式只能拿到 **720P**（`platform=html5` 接口的上限）。点击首页右上角 **Cookie**（或提示条「配置 Cookie 解锁 1080P」）进入设置页，粘贴浏览器里的 Cookie 后即可按账号权限解析更高清晰度。
+
+**拿 Cookie 最快的办法**
+
+1. 电脑 Chrome 登录 [bilibili.com](https://www.bilibili.com/)，F12 → Network → 刷新页面
+2. 点任意 `bilibili.com` 请求 → Request Headers → 复制整行 `Cookie:`
+3. 发到手机（微信 / 文件传输助手），在设置页粘贴 → **保存并应用**
+
+**支持的粘贴格式**（自动清洗，夹带说明文字、换行、引号、JSON 都能识别）
+
+```
+SESSDATA=xxx; bili_jct=yyy; buvid3=zzz; DedeUserID=12345
+{"SESSDATA": "xxx", "bili_jct": "yyy"}
+```
+
+**实现要点**
+
+- `SESSDATA` 是登录凭证；缺少 `buvid3` 时 App 会自动生成并保存一个设备指纹，保证 Cookie 可被服务端校验
+- 解析参数从 `platform=html5` 切换为 `platform=pc&fnval=1&high_quality=1&fourk=1`
+- 服务端不会因 `qn` 过高报错，而是**静默回落到账号 / 视频可达的最高档**：App 先请求比上次更高的档位，返回低于请求档位即视为上限并停止，通常 1~2 次请求确定画质
+- 记住上次实际拿到的清晰度，下次解析直接从该档位起步
+- CDN 直链统一带 `Referer` / `Origin` / `User-Agent`（下载、剪辑 Range 请求、预览、缩略图全部覆盖），否则 upos 会返回 403
+- Cookie 仅存于应用私有 `SharedPreferences`，不上传任何服务器；「退出登录 / 清除」随时删除
+- 1080P 及以上需要**登录**；4K / HDR / 杜比需要**大会员**；视频本身没上传高清时无法凭空得到
+
 ## 解析原理
 
-只使用 B 站公开 Web 接口，**不携带 Cookie、无需登录**：
+只使用 B 站公开 Web 接口，游客模式无需登录；配置 Cookie 后请求会自动携带：
 
 ```
 输入（分享文案 / 链接 / BV / av）
@@ -30,18 +58,20 @@
        └─ av 号：交给 view 接口用 aid 查询，返回体里带 bvid
   └─ GET api.bilibili.com/x/web-interface/view
         → 标题、封面、UP 主、时长、分 P、cid
-  └─ GET api.bilibili.com/x/player/playurl?...&platform=html5
-        → durl[0].url（MP4 直链，带时效签名）
-  └─ 展示 / 播放 / 下载
+  └─ GET api.bilibili.com/x/player/playurl
+       ├─ 游客：platform=html5&qn=64                          → 最高 720P
+       └─ 登录：platform=pc&fnval=1&qn=112/80/116...          → 按权限取最高
+        → durl[0].url（MP4 直链，带时效签名）；仅返回 DASH 时退化为视频流地址
+  └─ 展示 / 播放 / 下载（带 Referer、Origin、UA）
 ```
 
-代码位置：`app/src/main/java/com/videoparser/bili/BiliParser.kt`。
+代码位置：`app/src/main/java/com/videoparser/bili/BiliParser.kt`、`BiliCookie.kt`、`BiliCookieStore.kt`。
 
 移植自 [parse-video-py](https://github.com/wujunwei928/parse-video-py) 的 `BiliBili` 解析器（MIT），并做了端上适配：
 
 - 图片地址 `http://`、`//` 统一升级为 `https://`
 - `av` 号通过 `view?aid=` 自动换取 `bvid`
-- 常见接口错误码转成中文提示（稿件不可见、充电专属、风控等）
+- 常见接口错误码转成中文提示（稿件不可见、充电专属、风控、登录失效等）
 
 ## 剪辑下载
 
@@ -76,15 +106,19 @@
 
 ```
 app/src/main/java/com/videoparser/bili/
-├── MainActivity.kt      # Compose UI：主界面、卡片、按钮、进度、播放器、剪辑页
-├── BiliViewModel.kt     # 状态管理：解析、下载、剪辑、缩略图、复制
-├── BiliParser.kt        # B 站解析：链接识别、view/playurl 接口、JSON 映射
-├── VideoDownloader.kt   # 相册保存：视频 / 封面、Range 下载、进度
+├── MainActivity.kt      # Compose UI：主界面、卡片、按钮、进度、播放器、Cookie 设置页、剪辑页
+├── BiliViewModel.kt     # 状态管理：解析、下载、剪辑、缩略图、复制、Cookie 登录态
+├── BiliParser.kt        # B 站解析：链接识别、view/playurl 接口、清晰度策略、JSON 映射
+├── BiliCookie.kt        # Cookie 清洗 / 登录态 / 设备指纹 / 清晰度偏好（纯 Kotlin）
+├── BiliCookieStore.kt   # Cookie 与清晰度偏好的 SharedPreferences 持久化
+├── VideoDownloader.kt   # 相册保存：视频 / 封面、Range 下载、CDN 请求头、进度
 ├── VideoClipper.kt      # 剪辑编排：moov 探测、Range 片段下载、降级剪切
 ├── Mp4Boxes.kt          # MP4 元数据解析（纯 Kotlin）
 └── Mp4Clipper.kt        # 剪辑核心（纯 Kotlin）：容器重建、box 写入
 app/src/test/java/com/videoparser/bili/
 ├── BiliParserTest.kt        # 链接识别、JSON 映射、错误文案、时长格式
+├── BiliCookieTest.kt        # Cookie 清洗 / 设备指纹 / 脱敏 / 清晰度策略 / playurl 映射
+├── Mp4ClipTest.kt           # MP4 解析与剪辑数学
 └── VideoDownloaderTest.kt   # 文件名清洗
 ```
 
@@ -133,7 +167,9 @@ Android 10+ 通过 `MediaStore` 写入，不需要存储权限。
 
 ## 已知限制
 
-- 未登录只能拿到 **720P**（`platform=html5` 接口的上限）；1080P+ / 4K 需要大会员 Cookie，本项目不做登录
+- 未配置 Cookie 只能拿到 **720P**（`platform=html5` 接口的上限）；配置 Cookie 后可到 1080P / 1080P+ / 1080P60，4K / HDR / 杜比需要 **大会员账号**，番剧等付费内容仍可能受限
+- 清晰度上限同时受视频本身限制：UP 主只上传了 720P 时，登录也无法得到 1080P
+- 登录状态的稳定性取决于所粘贴 Cookie 与设备指纹是否配套；如出现「登录状态无效」提示，重新登录并粘贴新的 Cookie
 - 只解析 **P1**；多 P 视频会在信息栏显示「P1 / 共 N P」，剪辑同样只针对 P1
 - 番剧、付费课程、充电专属、互动视频通常没有 `durl`，会给出明确错误提示
 - 直链带时效签名（约 2 小时），解析后请尽快播放 / 下载
@@ -144,4 +180,4 @@ Android 10+ 通过 `MediaStore` 写入，不需要存储权限。
 
 ## 免责声明
 
-本项目仅用于个人学习与技术研究。请勿用于商业用途或大规模抓取；下载的内容版权归原作者及平台所有，请遵守 B 站用户协议与相关法律法规。
+本项目仅用于个人学习与技术研究。请勿用于商业用途或大规模抓取；下载的内容版权归原作者及平台所有，请遵守 B 站用户协议与相关法律法规。Cookie 属于个人登录凭证，仅保存在本机，请勿分享给他人。

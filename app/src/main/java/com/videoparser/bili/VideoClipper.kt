@@ -371,6 +371,7 @@ object VideoClipper {
             .header("Range", "bytes=0-${bytes - 1}")
             .header("User-Agent", BiliParser.USER_AGENT)
             .header("Referer", BiliParser.REFERER)
+            .header("Origin", "https://www.bilibili.com")
             .get()
             .build()
         BiliParser.http.newCall(request).execute().use { response ->
@@ -396,6 +397,7 @@ object VideoClipper {
             .header("Range", "bytes=$start-${start + length - 1}")
             .header("User-Agent", BiliParser.USER_AGENT)
             .header("Referer", BiliParser.REFERER)
+            .header("Origin", "https://www.bilibili.com")
             .get()
             .build()
         BiliParser.http.newCall(request).execute().use { response ->
@@ -422,6 +424,7 @@ object VideoClipper {
                 .header("Range", "bytes=0-0")
                 .header("User-Agent", BiliParser.USER_AGENT)
                 .header("Referer", BiliParser.REFERER)
+                .header("Origin", "https://www.bilibili.com")
                 .head()
                 .build()
             BiliParser.http.newCall(request).execute().use { response ->
@@ -455,6 +458,7 @@ object VideoClipper {
                 .header("Range", "bytes=$rangeStart-${rangeEndExclusive - 1}")
                 .header("User-Agent", BiliParser.USER_AGENT)
                 .header("Referer", BiliParser.REFERER)
+                .header("Origin", "https://www.bilibili.com")
                 .get()
                 .build()
             BiliParser.http.newCall(request).execute().use { response ->
@@ -513,13 +517,7 @@ object VideoClipper {
         return try {
             val retriever = MediaMetadataRetriever()
             try {
-                retriever.setDataSource(
-                    url,
-                    hashMapOf(
-                        "User-Agent" to BiliParser.USER_AGENT,
-                        "Referer" to BiliParser.REFERER
-                    )
-                )
+                retriever.setDataSource(url, VideoDownloader.mediaHeaders())
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: -1L
             } finally {
                 try { retriever.release() } catch (e: Exception) {}

@@ -31,28 +31,38 @@ object VideoDownloader {
 
     private const val FOLDER = "BiliParser"
 
+    /**
+     * B 站 CDN 直链的请求头。
+     *
+     * 1080P 直链（platform=pc）比 html5 直链校验更严格：缺 Referer / Origin 或
+     * Range 请求不带这些头时，upos / akamai CDN 会返回 403，因此统一由这里生成。
+     */
+    fun mediaHeaders(range: String? = null): HashMap<String, String> = hashMapOf(
+        "User-Agent" to BiliParser.USER_AGENT,
+        "Referer" to BiliParser.REFERER,
+        "Origin" to "https://www.bilibili.com",
+        "Accept" to "*/*"
+    ).apply {
+        if (range != null) put("Range", range)
+    }
+
+    private fun mediaRequest(url: String, head: Boolean = false, range: String? = null): Request {
+        val builder = Request.Builder().url(url)
+        if (head) builder.head() else builder.get()
+        mediaHeaders().forEach { (key, value) -> builder.header(key, value) }
+        if (range != null) builder.header("Range", range)
+        return builder.build()
+    }
+
     suspend fun fetchSize(url: String): Long = withContext(Dispatchers.IO) {
         try {
-            val head = Request.Builder()
-                .url(url)
-                .head()
-                .header("User-Agent", BiliParser.USER_AGENT)
-                .header("Referer", BiliParser.REFERER)
-                .build()
-            BiliParser.http.newCall(head).execute().use { response ->
+            BiliParser.http.newCall(mediaRequest(url, head = true)).execute().use { response ->
                 val length = response.header("Content-Length")?.toLongOrNull() ?: -1L
                 if (response.isSuccessful && length > 0) return@withContext length
             }
 
             // 部分 CDN 不支持 HEAD，退化为 Range 请求只取 1 字节
-            val range = Request.Builder()
-                .url(url)
-                .get()
-                .header("Range", "bytes=0-0")
-                .header("User-Agent", BiliParser.USER_AGENT)
-                .header("Referer", BiliParser.REFERER)
-                .build()
-            BiliParser.http.newCall(range).execute().use { response ->
+            BiliParser.http.newCall(mediaRequest(url, range = "bytes=0-0")).execute().use { response ->
                 response.header("Content-Range")
                     ?.substringAfterLast('/', "")
                     ?.toLongOrNull()
@@ -73,14 +83,7 @@ object VideoDownloader {
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             val fileName = buildFileName(title, bvid) + ".mp4"
-            val request = Request.Builder()
-                .url(url)
-                .get()
-                .header("User-Agent", BiliParser.USER_AGENT)
-                .header("Referer", BiliParser.REFERER)
-                .build()
-
-            BiliParser.http.newCall(request).execute().use { response ->
+            BiliParser.http.newCall(mediaRequest(url)).execute().use { response ->
                 if (!response.isSuccessful) return@withContext false
                 val body = response.body ?: return@withContext false
                 val total = body.contentLength().takeIf { it > 0 } ?: 0L
@@ -187,14 +190,8 @@ object VideoDownloader {
         if (rangeEndExclusive <= rangeStart) return@withContext false
         val total = rangeEndExclusive - rangeStart
         try {
-            val request = Request.Builder()
-                .url(url)
-                .get()
-                .header("Range", "bytes=$rangeStart-${rangeEndExclusive - 1}")
-                .header("User-Agent", BiliParser.USER_AGENT)
-                .header("Referer", BiliParser.REFERER)
-                .build()
-            BiliParser.http.newCall(request).execute().use { response ->
+            val range = "bytes=$rangeStart-${rangeEndExclusive - 1}"
+            BiliParser.http.newCall(mediaRequest(url, range = range)).execute().use { response ->
                 if (response.code != 206) return@withContext false
                 val body = response.body ?: return@withContext false
                 var downloaded = 0L
@@ -235,13 +232,7 @@ object VideoDownloader {
         onProgress: (downloaded: Long, total: Long) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            val request = Request.Builder()
-                .url(url)
-                .get()
-                .header("User-Agent", BiliParser.USER_AGENT)
-                .header("Referer", BiliParser.REFERER)
-                .build()
-            BiliParser.http.newCall(request).execute().use { response ->
+            BiliParser.http.newCall(mediaRequest(url)).execute().use { response ->
                 if (!response.isSuccessful) return@withContext false
                 val body = response.body ?: return@withContext false
                 val total = body.contentLength().takeIf { it > 0 } ?: 0L

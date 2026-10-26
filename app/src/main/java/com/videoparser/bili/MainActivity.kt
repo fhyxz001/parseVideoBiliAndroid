@@ -37,6 +37,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -185,7 +186,8 @@ class MainActivity : ComponentActivity() {
 
             BiliScreen(
                 vm = viewModel,
-                requestStorage = { action -> withStoragePermission(action) }
+                requestStorage = { action -> withStoragePermission(action) },
+                requestCookie = { viewModel.openCookiePage() }
             )
         }
     }
@@ -273,7 +275,11 @@ private fun cardMaxWidth(): Dp {
 /* ═══════════════════════ 主界面 ═══════════════════════ */
 
 @Composable
-fun BiliScreen(vm: BiliViewModel, requestStorage: (() -> Unit) -> Unit) {
+fun BiliScreen(
+    vm: BiliViewModel,
+    requestStorage: (() -> Unit) -> Unit,
+    requestCookie: () -> Unit
+) {
     val pad = responsivePadding()
 
     Box(
@@ -290,7 +296,7 @@ fun BiliScreen(vm: BiliViewModel, requestStorage: (() -> Unit) -> Unit) {
                 .padding(horizontal = pad, vertical = 12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Header()
+            Header(loggedIn = vm.loggedIn, onOpenCookie = requestCookie)
 
             Spacer(Modifier.height(14.dp))
 
@@ -327,6 +333,10 @@ fun BiliScreen(vm: BiliViewModel, requestStorage: (() -> Unit) -> Unit) {
 
             Spacer(Modifier.height(8.dp))
 
+            QualityHint(vm, onOpenCookie = requestCookie)
+
+            Spacer(Modifier.height(8.dp))
+
             Text(
                 text = "支持 b23.tv 短链、BV 号与 av 号",
                 color = iOSTertiary,
@@ -338,9 +348,9 @@ fun BiliScreen(vm: BiliViewModel, requestStorage: (() -> Unit) -> Unit) {
 
             val data = vm.video
             if (data != null) {
-                ResultSection(vm, data, requestStorage)
+                ResultSection(vm, data, requestStorage, requestCookie)
             } else {
-                EmptyState()
+                EmptyState(onOpenCookie = requestCookie)
             }
 
             Spacer(Modifier.height(20.dp))
@@ -394,11 +404,26 @@ fun BiliScreen(vm: BiliViewModel, requestStorage: (() -> Unit) -> Unit) {
         ) {
             ClipPage(vm, requestStorage)
         }
+
+        // 清晰度 / Cookie 设置页：全屏覆盖，从右侧滑入
+        AnimatedVisibility(
+            visible = vm.showCookiePage,
+            enter = slideInHorizontally(initialOffsetX = { it }) + fadeIn(),
+            exit = slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
+        ) {
+            CookiePage(vm) { message -> vm.showToast(message) }
+        }
     }
 }
 
+/**
+ * 主界面顶部图标按钮（与品牌角标对称）：已配置 Cookie 时显示已解锁 1080P 的状态。
+ */
 @Composable
-private fun Header() {
+private fun Header(
+    loggedIn: Boolean,
+    onOpenCookie: () -> Unit
+) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
@@ -416,17 +441,49 @@ private fun Header() {
             )
             Spacer(Modifier.height(4.dp))
             Text(
-                text = "原画直链 · 一键存相册",
+                text = if (loggedIn) "已登录 · 支持 1080P 高清" else "原画直链 · 一键存相册",
                 fontSize = 12.sp,
-                color = iOSSecondary,
+                color = if (loggedIn) iOSGreen else iOSSecondary,
                 letterSpacing = 0.3.sp
             )
         }
 
-        // 品牌角标
+        // 右上：账号 / Cookie 设置入口
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
+                .clip(CircleShape)
+                .background(if (loggedIn) iOSGreen.copy(alpha = 0.14f) else Color.White.copy(alpha = 0.7f))
+                .border(
+                    width = 1.dp,
+                    color = if (loggedIn) iOSGreen.copy(alpha = 0.35f) else iOSSeparator,
+                    shape = CircleShape
+                )
+                .clickable(interactionSource = null, indication = null, onClick = onOpenCookie)
+                .padding(horizontal = 10.dp, vertical = 6.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(if (loggedIn) iOSGreen else iOSTertiary)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = if (loggedIn) "已登录" else "Cookie",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (loggedIn) iOSGreen else iOSSecondary
+                )
+            }
+        }
+
+        // 品牌角标（放在右上角按钮下方，避免遮挡）
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .offset(y = 34.dp)
                 .clip(RoundedCornerShape(9.dp))
                 .background(Brush.linearGradient(listOf(BiliPink, BiliPinkDeep)))
                 .padding(horizontal = 9.dp, vertical = 5.dp)
@@ -437,6 +494,82 @@ private fun Header() {
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 0.2.sp
+            )
+        }
+    }
+}
+
+/**
+ * 清晰度提示条：
+ * - 游客：提醒配置 Cookie 可解锁 1080P（可一键打开设置）
+ * - 登录：显示本次实际拿到的清晰度（解析后）
+ */
+@Composable
+private fun QualityHint(vm: BiliViewModel, onOpenCookie: () -> Unit) {
+    val loggedIn = vm.loggedIn
+    val video = vm.video
+    val highQuality = video != null && video.quality >= BiliParser.QUALITY_1080P
+
+    val text: String
+    val color: Color
+    val clickable: Boolean
+    when {
+        loggedIn && highQuality -> {
+            text = "当前清晰度 ${video!!.qualityLabel} · 已解锁高清"
+            color = iOSGreen
+            clickable = false
+        }
+        loggedIn && video != null -> {
+            text = "当前清晰度 ${video.qualityLabel} · 该视频暂无更高画质"
+            color = iOSSecondary
+            clickable = false
+        }
+        loggedIn -> {
+            text = "已登录，1080P 及以上清晰度可用"
+            color = iOSGreen
+            clickable = false
+        }
+        else -> {
+            text = "未登录仅 720P，配置 Cookie 解锁 1080P ›"
+            color = iOSBlue
+            clickable = true
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .widthIn(max = cardMaxWidth())
+            .clip(RoundedCornerShape(50))
+            .background(color.copy(alpha = 0.10f))
+            .then(
+                if (clickable) {
+                    Modifier.clickable(interactionSource = null, indication = null, onClick = onOpenCookie)
+                } else {
+                    Modifier
+                }
+            )
+            .padding(horizontal = 14.dp, vertical = 8.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = if (highQuality) "HD" else "HD",
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(color)
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = text,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+                color = color,
+                textAlign = TextAlign.Center
             )
         }
     }
@@ -550,7 +683,8 @@ private fun InputCard(
 private fun ResultSection(
     vm: BiliViewModel,
     data: BiliVideo,
-    requestStorage: (() -> Unit) -> Unit
+    requestStorage: (() -> Unit) -> Unit,
+    requestCookie: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -582,6 +716,38 @@ private fun ResultSection(
             fontSize = 13.sp,
             fontWeight = FontWeight.Medium
         )
+
+        // 游客态：提示可升级
+        if (!data.loggedIn && data.quality <= BiliParser.QUALITY_GUEST_MAX && !vm.loggedIn) {
+            Spacer(Modifier.height(8.dp))
+            Box(
+                modifier = Modifier
+                    .align(Alignment.CenterHorizontally)
+                    .clip(RoundedCornerShape(50))
+                    .background(iOSGreen.copy(alpha = 0.12f))
+                    .clickable(interactionSource = null, indication = null, onClick = requestCookie)
+                    .padding(horizontal = 14.dp, vertical = 7.dp)
+            ) {
+                Text(
+                    text = "配置 Cookie 可获取 1080P ›",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = iOSGreen
+                )
+            }
+        }
+        // 已登录但本视频仍只有低清：说明是视频本身 / 大会员限制
+        if (data.loggedIn && data.quality <= BiliParser.QUALITY_GUEST_MAX) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "该视频最高只有 ${data.qualityLabel}，1080P 需要 UP 主上传高清或大会员权限",
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                fontSize = 11.sp,
+                color = iOSTertiary,
+                lineHeight = 16.sp
+            )
+        }
 
         Spacer(Modifier.height(10.dp))
 
@@ -914,7 +1080,7 @@ private fun ProgressSection(
 /* ═══════════════════════ 空状态 ═══════════════════════ */
 
 @Composable
-private fun EmptyState() {
+private fun EmptyState(onOpenCookie: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -983,6 +1149,22 @@ private fun EmptyState() {
             fontSize = 13.sp,
             color = iOSTertiary
         )
+        Spacer(Modifier.height(14.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(50))
+                .background(iOSBlue.copy(alpha = 0.10f))
+                .border(1.dp, iOSBlue.copy(alpha = 0.20f), RoundedCornerShape(50))
+                .clickable(interactionSource = null, indication = null, onClick = onOpenCookie)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
+        ) {
+            Text(
+                text = "配置 Cookie 解锁 1080P",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = iOSBlue
+            )
+        }
     }
 }
 
@@ -1112,6 +1294,382 @@ private fun PlayerDialog(video: BiliVideo, onDismiss: () -> Unit) {
                     Text("✕", color = Color.White, fontSize = 14.sp)
                 }
             }
+        }
+    }
+}
+
+/* ═══════════════════════ Cookie 设置页 ═══════════════════════ */
+
+/**
+ * 全屏 Cookie 设置页。
+ *
+ * 说明列表直接告诉用户「去哪里拿 Cookie」，粘贴框支持整段 Cookie 头，
+ * 保存后自动清洗（去掉说明文字 / 引号 / 换行）并补齐设备指纹 buvid3。
+ */
+@Composable
+private fun CookiePage(vm: BiliViewModel, onToast: (String) -> Unit) {
+    BackHandler(enabled = vm.showCookiePage) { vm.closeCookiePage() }
+    val focusManager = LocalFocusManager.current
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BgGradient)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .imePadding()
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .widthIn(max = cardMaxWidth())
+                .align(Alignment.TopCenter)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp)
+                    .padding(top = 8.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(iOSCardBg)
+                        .border(1.dp, iOSSeparator, CircleShape)
+                        .clickable(interactionSource = null, indication = null, onClick = vm::closeCookiePage),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("←", fontSize = 18.sp, color = iOSLabel, fontWeight = FontWeight.SemiBold)
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "清晰度 / Cookie",
+                        fontSize = 19.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = iOSLabel,
+                        letterSpacing = (-0.4).sp
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        "配置登录 Cookie 后即可解析 1080P / 4K",
+                        fontSize = 12.sp,
+                        color = iOSSecondary
+                    )
+                }
+                StatusPill(loggedIn = vm.loggedIn)
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp)
+            ) {
+                CookieHowToCard()
+
+                Spacer(Modifier.height(12.dp))
+
+                // 已保存状态
+                if (vm.hasSavedCookie) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(iOSCardBg)
+                            .border(1.dp, iOSSeparator, RoundedCornerShape(20.dp))
+                            .padding(16.dp)
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .size(8.dp)
+                                    .clip(CircleShape)
+                                    .background(iOSGreen)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "当前已保存的 Cookie",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = iOSLabel
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            vm.cookieMask.ifBlank { "—" },
+                            fontSize = 12.sp,
+                            color = iOSSecondary,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 18.sp
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(42.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(Color(0xFFFF3B30).copy(alpha = 0.08f))
+                                    .border(1.dp, Color(0xFFFF3B30).copy(alpha = 0.25f), RoundedCornerShape(12.dp))
+                                    .clickable(interactionSource = null, indication = null, onClick = vm::clearCookie),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "退出登录 / 清除",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color(0xFFFF3B30)
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(42.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(iOSBgBase)
+                                    .border(1.dp, iOSSeparator, RoundedCornerShape(12.dp))
+                                    .clickable(interactionSource = null, indication = null) {
+                                        vm.pasteCookieFromClipboard()?.let { text ->
+                                            vm.onCookieInputChanged(text)
+                                            focusManager.clearFocus()
+                                        } ?: onToast("剪贴板里没有内容")
+                                    },
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    "从剪贴板粘贴",
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = iOSLabel
+                                )
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+
+                // 输入框
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(iOSCardBg)
+                        .border(1.dp, iOSSeparator, RoundedCornerShape(20.dp))
+                        .padding(16.dp)
+                ) {
+                    Text(
+                        "粘贴 Cookie",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = iOSLabel
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "整段粘贴即可：SESSDATA=xxx; bili_jct=yyy; buvid3=zzz",
+                        fontSize = 11.sp,
+                        color = iOSTertiary,
+                        lineHeight = 16.sp
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    BasicTextField(
+                        value = vm.cookieInput,
+                        onValueChange = vm::onCookieInputChanged,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 96.dp, max = 160.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(iOSBgBase)
+                            .border(1.dp, iOSSeparator, RoundedCornerShape(12.dp))
+                            .padding(12.dp)
+                            .verticalScroll(rememberScrollState()),
+                        textStyle = TextStyle(
+                            color = iOSLabel,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                            lineHeight = 18.sp
+                        ),
+                        cursorBrush = SolidColor(iOSBlue),
+                        decorationBox = { inner ->
+                            Box {
+                                if (vm.cookieInput.isEmpty()) {
+                                    Text(
+                                        "在这里粘贴 B 站 Cookie…",
+                                        color = iOSTertiary,
+                                        fontSize = 12.sp
+                                    )
+                                }
+                                inner()
+                            }
+                        }
+                    )
+
+                    vm.cookieError?.let { error ->
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "⚠ $error",
+                            fontSize = 12.sp,
+                            color = Color(0xFFFF3B30),
+                            lineHeight = 17.sp
+                        )
+                    }
+                    vm.cookieStatusMessage?.let { message ->
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "✓ $message",
+                            fontSize = 12.sp,
+                            color = iOSGreen,
+                            lineHeight = 17.sp
+                        )
+                    }
+
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        PressButton(
+                            modifier = Modifier.weight(1f),
+                            height = 46.dp,
+                            onClick = vm::saveCookie,
+                            background = iOSBlue,
+                            shadowColor = iOSBlue.copy(alpha = 0.3f),
+                            contentColor = Color.White
+                        ) {
+                            Text(
+                                "保存并应用",
+                                color = Color.White,
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(iOSBgBase)
+                                .border(1.dp, iOSSeparator, RoundedCornerShape(16.dp))
+                                .clickable(interactionSource = null, indication = null) {
+                                    val text = vm.pasteCookieFromClipboard()
+                                    if (text == null) {
+                                        onToast("剪贴板里没有内容")
+                                    } else {
+                                        vm.onCookieInputChanged(text)
+                                        focusManager.clearFocus()
+                                    }
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                "粘贴",
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = iOSLabel
+                            )
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusPill(loggedIn: Boolean) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(
+                if (loggedIn) iOSGreen.copy(alpha = 0.14f) else iOSTertiary.copy(alpha = 0.16f)
+            )
+            .padding(horizontal = 10.dp, vertical = 5.dp)
+    ) {
+        Text(
+            text = if (loggedIn) "已登录" else "游客",
+            fontSize = 11.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (loggedIn) iOSGreen else iOSSecondary
+        )
+    }
+}
+
+/** 「怎么拿 Cookie」步骤说明 */
+@Composable
+private fun CookieHowToCard() {
+    val steps = listOf(
+        "手机浏览器打开 bilibili.com 并登录" to "推荐用浏览器登录，网页版 Cookie 有效期更稳定",
+        "复制时不要漏掉 SESSDATA" to "SESSDATA 是登录凭证；bili_jct、buvid3 有就一起带上",
+        "回到这里粘贴并保存" to "保存后重新解析，1080P / 1080P+ / 4K 按账号权限自动选择"
+    )
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(20.dp))
+            .background(iOSCardBg)
+            .border(1.dp, iOSSeparator, RoundedCornerShape(20.dp))
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("🔐", fontSize = 16.sp)
+            Spacer(Modifier.width(8.dp))
+            Text(
+                "如何获取 Cookie",
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = iOSLabel
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "用当前手机登录时更稳妥：电脑 Chrome 复制 → 发到手机 → 粘贴到这里",
+            fontSize = 11.sp,
+            color = iOSSecondary,
+            lineHeight = 16.sp
+        )
+        steps.forEachIndexed { index, (title, detail) ->
+            Spacer(Modifier.height(14.dp))
+            Row {
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clip(CircleShape)
+                        .background(iOSBlue.copy(alpha = 0.12f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        "${index + 1}",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = iOSBlue
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = iOSLabel)
+                    Spacer(Modifier.height(2.dp))
+                    Text(detail, fontSize = 11.sp, color = iOSSecondary, lineHeight = 16.sp)
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(iOSBgBase)
+                .padding(12.dp)
+        ) {
+            Text(
+                text = "「开发者工具」获取方式：电脑 Chrome 登录 bilibili.com → F12 → Network → " +
+                    "刷新页面 → 点任意 bilibili.com 请求 → Request Headers 里的 Cookie 一行整段复制。\n" +
+                    "Cookie 只保存在本机应用私有目录，不会上传；清楚 1080P 需登录，4K / HDR 需大会员。",
+                fontSize = 11.sp,
+                color = iOSSecondary,
+                lineHeight = 17.sp
+            )
         }
     }
 }
