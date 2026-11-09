@@ -83,116 +83,6 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
     val toastEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val copyEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
-    /* ═════════════════════ Cookie / 清晰度 ═════════════════════ */
-
-    /** 设置页开关 */
-    var showCookiePage by mutableStateOf(false)
-        private set
-
-    /** 是否已配置可用 Cookie */
-    var loggedIn by mutableStateOf(false)
-        private set
-
-    /** 设置页里正在编辑的 Cookie 文本 */
-    var cookieInput by mutableStateOf("")
-        private set
-
-    /** 是否已保存过 Cookie（决定「退出登录」是否可点） */
-    var hasSavedCookie by mutableStateOf(false)
-        private set
-
-    /** 保存后的脱敏展示 */
-    var cookieMask by mutableStateOf("")
-        private set
-
-    var cookieStatusMessage by mutableStateOf<String?>(null)
-        private set
-
-    var cookieError by mutableStateOf<String?>(null)
-        private set
-
-    init {
-        loadCookieState()
-    }
-
-    private fun loadCookieState() {
-        val app = getApplication<Application>()
-        hasSavedCookie = BiliCookieStore.saved(app).isNotBlank()
-        loggedIn = BiliCookieStore.load(app)
-        cookieMask = BiliCookie.mask(BiliCookie.current)
-    }
-
-    /** 本次解析 / 下载要用的 Cookie（[BiliCookie.apply] 已补齐设备指纹 buvid3） */
-    fun biliCookieHeader(): String = BiliCookie.current
-
-    fun openCookiePage() {
-        cookieInput = BiliCookieStore.saved(getApplication())
-        cookieError = null
-        cookieStatusMessage = null
-        showCookiePage = true
-    }
-
-    fun closeCookiePage() {
-        showCookiePage = false
-        cookieError = null
-        cookieStatusMessage = null
-    }
-
-    fun onCookieInputChanged(text: String) {
-        cookieInput = text
-        cookieError = null
-        cookieStatusMessage = null
-    }
-
-    /** 从剪贴板读取 Cookie（不修改输入框以外的状态） */
-    fun pasteCookieFromClipboard(): String? {
-        val manager = getApplication<Application>()
-            .getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        return manager?.primaryClip
-            ?.takeIf { it.itemCount > 0 }
-            ?.getItemAt(0)
-            ?.text
-            ?.toString()
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-    }
-
-    fun saveCookie() {
-        val raw = cookieInput.trim()
-        if (raw.isEmpty()) {
-            cookieError = "请先粘贴 Cookie"
-            return
-        }
-        try {
-            val saved = BiliCookieStore.save(getApplication(), raw)
-            cookieInput = saved
-            loggedIn = true
-            hasSavedCookie = true
-            cookieMask = BiliCookie.mask(BiliCookie.current)
-            cookieError = null
-            cookieStatusMessage = "Cookie 已保存，重新解析即可获取 1080P"
-            toast("Cookie 已保存")
-            // 已有解析结果时，自动按新 Cookie 重新解析一次
-            if (video != null) {
-                closeCookiePage()
-                parse()
-            }
-        } catch (e: IllegalArgumentException) {
-            cookieError = e.message ?: "Cookie 格式无法识别"
-        }
-    }
-
-    fun clearCookie() {
-        BiliCookieStore.clear(getApplication())
-        cookieInput = ""
-        loggedIn = false
-        hasSavedCookie = false
-        cookieMask = ""
-        cookieError = null
-        cookieStatusMessage = "已退出登录，清晰度将限制为 720P"
-        toast("已清除 Cookie")
-    }
-
     fun onInputChanged(value: String) {
         input = value
     }
@@ -231,9 +121,6 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
         toastEvents.tryEmit(message)
     }
 
-    /** 供 UI 直接触发的轻提示（如设置页粘贴失败） */
-    fun showToast(message: String) = toast(message)
-
     fun parse() {
         if (isParsing) return
         val text = input.trim()
@@ -251,33 +138,15 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
         showPlayer = false
         resetClipState()
 
-        val cookie = biliCookieHeader()
         viewModelScope.launch {
-            when (val result = BiliParser.parse(text, cookie)) {
+            when (val result = BiliParser.parse(text)) {
                 is BiliParseResult.Success -> {
-                    val parsed = result.data
-                    video = parsed
-                    // 记住实际拿到的清晰度，下次解析直接从该档位请求
-                    if (parsed.loggedIn) BiliCookieStore.saveQuality(getApplication(), parsed.quality)
-                    val hint = when {
-                        parsed.loggedIn && parsed.quality >= BiliParser.QUALITY_1080P ->
-                            "解析成功 · ${parsed.qualityLabel}"
-                        parsed.loggedIn ->
-                            "当前视频最高 ${parsed.qualityLabel}（1080P 及以上需大会员或原视频不支持）"
-                        parsed.quality > BiliParser.QUALITY_GUEST_MAX ->
-                            "解析成功 · ${parsed.qualityLabel}"
-                        else ->
-                            "解析成功 · ${parsed.qualityLabel}（配置 Cookie 可解锁 1080P）"
-                    }
-                    toast(hint)
-                    fetchFileSize(parsed.videoUrl)
+                    video = result.data
+                    toast("解析成功 · ${result.data.qualityLabel}")
+                    fetchFileSize(result.data.videoUrl)
                 }
                 is BiliParseResult.Error -> {
                     toast(result.message)
-                    // 风控 / 登录失效：直接打开设置页引导配置 Cookie
-                    if (result.message.contains("Cookie") || result.message.contains("风控")) {
-                        openCookiePage()
-                    }
                 }
             }
             isParsing = false
