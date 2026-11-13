@@ -3,32 +3,17 @@ package com.videoparser.bili
 import android.app.Application
 import android.content.ClipboardManager
 import android.content.Context
-import android.graphics.Bitmap
-import android.media.MediaMetadataRetriever
-import android.os.Build
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asAndroidBitmap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import java.util.Locale
-import kotlin.math.roundToLong
 
 class BiliViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -55,30 +40,11 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
     var isClipping by mutableStateOf(false)
     var clipPhaseText by mutableStateOf("")
     var clipPercent by mutableIntStateOf(0)
-    var clipThumbs by mutableStateOf<List<ImageBitmap?>>(emptyList())
-    var clipThumbsLoading by mutableStateOf(false)
-    var clipPresetSec by mutableIntStateOf(DEFAULT_CLIP_PRESET_SEC)
-    var clipCustomDuration by mutableStateOf(false)
     var clipResultFileName by mutableStateOf<String?>(null)
-    var clipStartFrame by mutableStateOf<ImageBitmap?>(null)
-    var clipEndFrame by mutableStateOf<ImageBitmap?>(null)
-    var showFrameSaveDialog by mutableStateOf(false)
-    var frameSaveIsStart by mutableStateOf(true)
-    var isSavingFrame by mutableStateOf(false)
 
     private var clipProbe: ClipProbe? = null
     private var clipProbeKey: String? = null
     private var clipJob: Job? = null
-    private var clipThumbsKey: String? = null
-
-    // 取帧专用（单实例复用，串行取帧防止并发崩溃）
-    private var frameRetriever: MediaMetadataRetriever? = null
-    private var frameUrl: String? = null
-    private var pendingStartMs: Long? = null
-    private var pendingEndMs: Long? = null
-    private var lastLoadedStartMs = Long.MIN_VALUE
-    private var lastLoadedEndMs = Long.MIN_VALUE
-    private val frameMutex = Mutex()
 
     val toastEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
     val copyEvents = MutableSharedFlow<String>(extraBufferCapacity = 8)
@@ -247,24 +213,16 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
     private fun resetClipState() {
         clipJob?.cancel()
         clipJob = null
-        releaseFrameRetriever()
         clipProbe = null
         clipProbeKey = null
-        clipThumbsKey = null
         clipProbing = false
         clipDurationMs = 0L
         clipStartMs = 0L
         clipEndMs = 0L
-        clipThumbs = emptyList()
-        clipThumbsLoading = false
-        clipPresetSec = DEFAULT_CLIP_PRESET_SEC
-        clipCustomDuration = false
         clipResultFileName = null
         isClipping = false
         clipPercent = 0
         clipPhaseText = ""
-        showFrameSaveDialog = false
-        isSavingFrame = false
     }
 
     fun openClipPage() {
@@ -274,12 +232,10 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
         }
         showClipPage = true
         ensureClipProbe()
-        ensureClipThumbs()
     }
 
     fun dismissClipPage() {
         if (isClipping) toast("剪辑仍在后台进行，完成后会提示")
-        releaseFrameRetriever()
         showClipPage = false
     }
 
@@ -302,72 +258,42 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
                     is ClipProbe.Fallback -> probed.durationMs
                 }
                 if (clipDurationMs > 0) {
-                    clipPresetSec = DEFAULT_CLIP_PRESET_SEC
-                    clipCustomDuration = false
+                    // 开始时间与截取时长均由用户输入（输入框默认留空），内部先置零
                     clipStartMs = 0L
-                    clipEndMs = minOf(clipDurationMs, DEFAULT_CLIP_PRESET_SEC * 1000L)
-                    if (clipEndMs - clipStartMs < MIN_CLIP_SPAN_MS) {
-                        clipStartMs = (clipEndMs - MIN_CLIP_SPAN_MS).coerceAtLeast(0L)
-                    }
+                    clipEndMs = 0L
                 }
                 clipProbing = false
-                ensureClipThumbs()
             }
         }
     }
 
-    fun applyClipPreset(seconds: Int) {
-        if (clipDurationMs <= 0 || seconds <= 0) return
-        clipPresetSec = seconds
-        clipCustomDuration = false
-        applySpanMs(seconds * 1000L)
-    }
-
-    fun applyClipCustomDuration(seconds: Double) {
-        if (clipDurationMs <= 0 || seconds <= 0) return
-        clipPresetSec = 0
-        clipCustomDuration = true
-        applySpanMs((seconds * 1000).roundToLong())
-    }
-
-    private fun applySpanMs(spanMs: Long) {
-        val span = spanMs.coerceAtLeast(MIN_CLIP_SPAN_MS)
-        clipEndMs = (clipStartMs + span).coerceAtMost(clipDurationMs)
-        if (clipEndMs - clipStartMs < MIN_CLIP_SPAN_MS) {
-            clipStartMs = (clipEndMs - MIN_CLIP_SPAN_MS).coerceAtLeast(0L)
+    /**
+     * 调整截取时长（时/分/秒输入）：保持开始时间不变，结束时间联动。
+     * 超出视频末尾时截到末尾，实际时长随之缩短；输入为空时时长为 0。
+     */
+    fun setClipDurationKeepingStart(durationMs: Long) {
+        if (clipDurationMs <= 0) return
+        if (durationMs <= 0L) {
+            clipEndMs = clipStartMs
+            return
         }
+        clipEndMs = (clipStartMs + durationMs).coerceAtMost(clipDurationMs)
     }
 
+    /**
+     * 调整开始时间（时/分/秒输入）：保持当前截取时长，结束时间联动。
+     * 剩余长度不足当前时长时，结束时间贴到视频末尾，实际时长随之缩短。
+     */
     fun setClipStartKeepingDuration(posMs: Long) {
         if (clipDurationMs <= 0) return
-        val span = (clipEndMs - clipStartMs).coerceIn(MIN_CLIP_SPAN_MS, clipDurationMs)
+        // 视频本身不足 1 秒时，下限退化为视频时长，避免 coerceIn 区间非法
+        val minSpan = minOf(MIN_CLIP_SPAN_MS, clipDurationMs)
+        val currentSpan = (clipEndMs - clipStartMs).coerceAtLeast(0L)
+        // 时长为空（0）时保持为空，不强行补足最小时长
+        val span = if (currentSpan == 0L) 0L else currentSpan.coerceIn(minSpan, clipDurationMs)
         val s = posMs.coerceIn(0L, (clipDurationMs - span).coerceAtLeast(0L))
         clipStartMs = s
         clipEndMs = (s + span).coerceAtMost(clipDurationMs)
-        if (clipEndMs - clipStartMs < MIN_CLIP_SPAN_MS) {
-            clipStartMs = (clipEndMs - MIN_CLIP_SPAN_MS).coerceAtLeast(0L)
-        }
-    }
-
-    fun setClipEndManual(posMs: Long) {
-        if (clipDurationMs <= 0) return
-        var e = posMs.coerceIn(0L, clipDurationMs)
-        if (e - clipStartMs < MIN_CLIP_SPAN_MS) {
-            e = (clipStartMs + MIN_CLIP_SPAN_MS).coerceAtMost(clipDurationMs)
-            if (e - clipStartMs < MIN_CLIP_SPAN_MS) {
-                clipStartMs = (e - MIN_CLIP_SPAN_MS).coerceAtLeast(0L)
-            }
-        }
-        clipEndMs = e
-        val spanSec = (e - clipStartMs) / 1000.0
-        val matched = CLIP_PRESET_SECONDS.firstOrNull { kotlin.math.abs(it - spanSec) < 0.4 }
-        if (matched != null) {
-            clipPresetSec = matched
-            clipCustomDuration = false
-        } else {
-            clipPresetSec = 0
-            clipCustomDuration = true
-        }
     }
 
     /** 当前实际截取时长（秒） */
@@ -441,219 +367,7 @@ class BiliViewModel(application: Application) : AndroidViewModel(application) {
         ClipPhase.SAVING -> "正在保存到相册..."
     }
 
-    /* ═════════════════════ 剪辑：缩略图与首尾帧 ═════════════════════ */
-
-    fun requestClipFrame(isStart: Boolean, timeMs: Long) {
-        if (isStart) {
-            if (timeMs == lastLoadedStartMs || timeMs == pendingStartMs) return
-            pendingStartMs = timeMs
-        } else {
-            if (timeMs == lastLoadedEndMs || timeMs == pendingEndMs) return
-            pendingEndMs = timeMs
-        }
-        runClipFrameLoader()
-    }
-
-    private fun runClipFrameLoader() {
-        val url = video?.videoUrl?.trim() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            frameMutex.withLock {
-                while (true) {
-                    val startTarget = pendingStartMs
-                    val endTarget = pendingEndMs
-                    if (startTarget == null && endTarget == null) break
-                    val retriever = ensureFrameRetriever(url) ?: break
-                    if (startTarget != null) {
-                        pendingStartMs = null
-                        val bmp = getFrame(retriever, startTarget, PREVIEW_TARGET_WIDTH)
-                        if (bmp != null && pendingStartMs == null) {
-                            clipStartFrame = scaleDown(bmp, PREVIEW_TARGET_WIDTH).asImageBitmap()
-                            lastLoadedStartMs = startTarget
-                        }
-                    }
-                    if (endTarget != null) {
-                        pendingEndMs = null
-                        val bmp = getFrame(retriever, endTarget, PREVIEW_TARGET_WIDTH)
-                        if (bmp != null && pendingEndMs == null) {
-                            clipEndFrame = scaleDown(bmp, PREVIEW_TARGET_WIDTH).asImageBitmap()
-                            lastLoadedEndMs = endTarget
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private suspend fun getFrame(
-        retriever: MediaMetadataRetriever,
-        timeMs: Long,
-        targetWidth: Int
-    ): Bitmap? = withContext(Dispatchers.IO) {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                retriever.getScaledFrameAtTime(
-                    timeMs * 1000,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                    targetWidth,
-                    targetWidth
-                )
-            } else {
-                retriever.getFrameAtTime(timeMs * 1000, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun ensureFrameRetriever(url: String): MediaMetadataRetriever? {
-        if (frameRetriever != null && frameUrl == url) return frameRetriever
-        releaseFrameRetriever()
-        return try {
-            val retriever = MediaMetadataRetriever()
-            retriever.setDataSource(url, mediaHeaders())
-            frameRetriever = retriever
-            frameUrl = url
-            retriever
-        } catch (e: Exception) {
-            frameRetriever = null
-            null
-        }
-    }
-
-    private fun releaseFrameRetriever() {
-        pendingStartMs = null
-        pendingEndMs = null
-        lastLoadedStartMs = Long.MIN_VALUE
-        lastLoadedEndMs = Long.MIN_VALUE
-        val retriever = frameRetriever
-        frameRetriever = null
-        frameUrl = null
-        clipStartFrame = null
-        clipEndFrame = null
-        runCatching { retriever?.release() }
-    }
-
-    fun onClipFrameClicked(isStart: Boolean) {
-        val frame = if (isStart) clipStartFrame else clipEndFrame
-        if (frame == null) {
-            toast("画面加载中，请稍候")
-            return
-        }
-        frameSaveIsStart = isStart
-        showFrameSaveDialog = true
-    }
-
-    fun dismissFrameSaveDialog() {
-        showFrameSaveDialog = false
-    }
-
-    fun confirmSaveFrame() {
-        if (isSavingFrame) return
-        val bitmap = (if (frameSaveIsStart) clipStartFrame else clipEndFrame)
-            ?.asAndroidBitmap() ?: return
-        showFrameSaveDialog = false
-        isSavingFrame = true
-        viewModelScope.launch {
-            val title = video?.title?.ifBlank { "bilibili" } ?: "bilibili"
-            val fileName = frameFileName(
-                title,
-                frameSaveIsStart,
-                if (frameSaveIsStart) clipStartMs else clipEndMs
-            )
-            val ok = VideoDownloader.saveBitmapToGallery(getApplication(), bitmap, fileName)
-            isSavingFrame = false
-            toast(if (ok) "已保存到相册" else "保存失败")
-        }
-    }
-
-    private fun frameFileName(title: String, isStart: Boolean, timeMs: Long): String {
-        val base = title.replace(Regex("""[\\/:*?"<>|]"""), "").ifBlank { "bilibili" }.take(60)
-        val side = if (isStart) "首帧" else "尾帧"
-        val totalSec = timeMs.coerceAtLeast(0L) / 1000
-        val t = String.format(
-            Locale.US, "%02d%02d%02d",
-            totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60
-        )
-        return "${base}_剪辑${side}_$t.jpg"
-    }
-
-    private fun ensureClipThumbs() {
-        val data = video ?: return
-        val key = data.videoUrl.trim()
-        if (key.isBlank()) return
-        if (clipThumbsKey == key && clipThumbs.isNotEmpty()) return
-        if (clipDurationMs <= 0) return
-        clipThumbsKey = key
-        clipThumbsLoading = true
-        clipThumbs = List(CLIP_THUMB_COUNT) { null }
-        viewModelScope.launch(Dispatchers.IO) {
-            val frames = loadClipThumbnails(key, clipDurationMs, CLIP_THUMB_COUNT)
-            if (clipThumbsKey == key) {
-                clipThumbs = frames
-                clipThumbsLoading = false
-            }
-        }
-    }
-
-    private suspend fun loadClipThumbnails(
-        url: String,
-        durationMs: Long,
-        count: Int
-    ): List<ImageBitmap?> = coroutineScope {
-        val retrievers = (0 until THUMB_WORKERS).map { MediaMetadataRetriever() }
-        try {
-            retrievers.forEach { it.setDataSource(url, mediaHeaders()) }
-            val results = arrayOfNulls<ImageBitmap>(count)
-            (0 until THUMB_WORKERS).map { worker ->
-                async {
-                    val retriever = retrievers[worker]
-                    for (i in worker until count step THUMB_WORKERS) {
-                        val posMs = (durationMs * (i + 0.5) / count).toLong()
-                        val frame = getFrame(retriever, posMs, THUMB_TARGET_WIDTH)
-                        val scaled =
-                            if (frame != null && Build.VERSION.SDK_INT < Build.VERSION_CODES.O_MR1) {
-                                scaleDown(frame, THUMB_TARGET_WIDTH)
-                            } else {
-                                frame
-                            }
-                        results[i] = scaled?.asImageBitmap()
-                        clipThumbs = results.toList()
-                    }
-                }
-            }.awaitAll()
-            results.toList()
-        } catch (e: Exception) {
-            List(count) { null }
-        } finally {
-            retrievers.forEach { runCatching { it.release() } }
-        }
-    }
-
-    private fun scaleDown(bitmap: Bitmap, targetWidth: Int): Bitmap {
-        if (bitmap.width <= targetWidth) return bitmap
-        val ratio = targetWidth.toFloat() / bitmap.width
-        return Bitmap.createScaledBitmap(
-            bitmap,
-            targetWidth,
-            (bitmap.height * ratio).toInt().coerceAtLeast(1),
-            true
-        )
-    }
-
-    private fun mediaHeaders(): HashMap<String, String> = VideoDownloader.mediaHeaders()
-
     companion object {
         private const val MIN_CLIP_SPAN_MS = 1000L
-
-        /** 默认快捷截取时长（秒） */
-        const val DEFAULT_CLIP_PRESET_SEC = 20
-
-        /** 快捷截取时长选项（秒） */
-        val CLIP_PRESET_SECONDS = listOf(20, 60, 120)
-
-        private const val CLIP_THUMB_COUNT = 16
-        private const val THUMB_WORKERS = 3
-        private const val THUMB_TARGET_WIDTH = 320
-        private const val PREVIEW_TARGET_WIDTH = 480
     }
 }
